@@ -1,7 +1,107 @@
-use std::env;
-use std::fs;
-use std::path::Path;
-use std::process::Command;
+use std::{
+    env,
+    fs::{self, File},
+    io::{self, Read, Seek, Write},
+    path::Path,
+};
+use tempfile::tempdir;
+use zip::write::FileOptions;
+
+fn zip_resource_files(resource_dirs: &Vec<&String>, target_path: &Path) -> io::Result<()> {
+    let inner = File::create(target_path)?;
+    let mut zip = zip::ZipWriter::new(inner);
+    let options = FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+
+    // Add each resource directory to the zip file
+    for (_idx, dir_path) in resource_dirs.iter().enumerate() {
+        let source_path = Path::new(dir_path);
+        if !source_path.exists() || !source_path.is_dir() {
+            continue; // Skip non-existent or non-directory paths
+        }
+
+        // Add directory contents to zip with prefix
+        let dir_name = source_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+        add_dir_to_zip(&mut zip, source_path, &format!("{}/", dir_name), options)?;
+    }
+
+    zip.finish()?;
+    Ok(())
+}
+
+/// Add directory contents to zip file recursively
+fn add_dir_to_zip(
+    zip: &mut zip::ZipWriter<File>,
+    source_dir: &Path,
+    prefix: &str,
+    options: FileOptions<()>,
+) -> io::Result<()> {
+    for entry in fs::read_dir(source_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let zip_path = format!("{}{}", prefix, file_name.to_string_lossy());
+
+        if path.is_dir() {
+            // Add subdirectory recursively
+            add_dir_to_zip(zip, &path, &format!("{}/", zip_path), options)?;
+        } else {
+            // Add file to zip
+            zip.start_file(zip_path, options)?;
+            let mut file = File::open(&path)?;
+            std::io::copy(&mut file, zip)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_into_main_exe(exe_path: &str, zip_path: &str, output_path: &str) -> io::Result<()> {
+    // 1. 打开文件
+    let mut exe_file = File::open(exe_path)?;
+    let mut zip_file = File::open(zip_path)?;
+    let mut output_file = File::create(output_path)?;
+
+    // 2. 获取源 EXE 的总长度
+    let exe_len = exe_file.metadata()?.len();
+    if exe_len < 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Source file too small, unable to read Footer",
+        ));
+    }
+
+    // 3. 读取源 EXE 最后 8 个字节（获取旧的 Size）
+    exe_file.seek(io::SeekFrom::End(-8))?;
+    let mut old_size_buffer = [0u8; 8];
+    exe_file.read_exact(&mut old_size_buffer)?;
+    let old_size = u64::from_le_bytes(old_size_buffer);
+
+    // 4. 复制源 EXE 的内容（**去掉**最后 8 个字节）
+    // 我们需要把指针移回开头
+    exe_file.seek(io::SeekFrom::Start(0))?;
+    // 使用 take() 只读取前 (总长度 - 8) 个字节
+    // 这样就相当于把旧的 Footer "删掉" 了，空出了位置给新 Zip
+    let mut exe_reader = exe_file.take(exe_len - 8);
+    io::copy(&mut exe_reader, &mut output_file)?;
+
+    // 5. 写入新的 Zip 内容，并获取新 Zip 的大小
+    let new_zip_size = io::copy(&mut zip_file, &mut output_file)?;
+
+    // 6. 计算新的 Footer 数值 (旧大小 + 新大小)
+    let final_size = old_size + new_zip_size;
+
+    // 7. 写入新的 Footer (8字节)
+    output_file.write_all(&final_size.to_le_bytes())?;
+
+    println!("Injection successful!");
+    println!("Original Footer value: {}", old_size);
+    println!("New Zip size: {}", new_zip_size);
+    println!("New Footer value: {}", final_size);
+
+    Ok(())
+}
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -19,303 +119,65 @@ fn main() {
         std::process::exit(1);
     }
 
-    let main_exe = &args[1];
-    let output: String = if args.contains(&"-o".to_string()) {
-        let pos = args.iter().position(|x| x == "-o").unwrap();
-        args[pos + 1].clone()
-    } else {
-        "bundled_app".to_string()
-    };
+    // Process resource directories - args[2] to args[args.len()-2] (before -o flag)
     let mut resource_dirs = Vec::new();
-
-    // 解析参数
     let mut i = 2;
-    while i < args.len() {
-        if args[i] == "-o" {
-            i += 2;
-        } else {
-            resource_dirs.push(&args[i]);
-            i += 1;
-        }
+
+    while i < args.len() && args[i] != "-o" {
+        resource_dirs.push(&args[i]);
+        i += 1;
     }
 
-    println!("AppBinder v1.0");
-    println!("Packaging: {} -> {}", main_exe, output);
+    if resource_dirs.is_empty() {
+        println!("No resource directories specified");
+    } else {
+        println!("Processing {} resource directories", resource_dirs.len());
 
-    // 检查主程序是否存在
-    if !Path::new(main_exe).exists() {
-        eprintln!("Error: Main executable '{}' not found", main_exe);
-        std::process::exit(1);
-    }
+        let temp_dir = match tempdir() {
+            Ok(dir) => dir,
+            Err(e) => {
+                eprintln!("Failed to create temporary directory: {}", e);
+                std::process::exit(1);
+            }
+        };
+        let zip_output_path = temp_dir.path().join("sekai-resource.zip");
 
-    // 开始打包
-    match create_bundled_app(main_exe, &resource_dirs, &output) {
-        Ok(()) => {
-            println!("Successfully created: {}", output);
-        }
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-    }
-}
-
-fn create_bundled_app(
-    main_exe: &str,
-    resource_dirs: &[&String],
-    output_file: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // 创建启动器代码
-    let launcher_c = generate_launcher_c();
-
-    // 临时目录
-    let temp_dir = "temp_build";
-    fs::create_dir_all(temp_dir)?;
-
-    // 写入启动器源码
-    fs::write(format!("{}/launcher.c", temp_dir), launcher_c)?;
-
-    // 编译启动器
-    println!("Compiling launcher...");
-    let output = Command::new("gcc")
-        .args(&[
-            "-o",
-            &format!("{}/launcher", temp_dir),
-            &format!("{}/launcher.c", temp_dir),
-            "-lz",
-        ])
-        .output()?;
-
-    if !output.status.success() {
-        eprintln!("GCC compilation failed:");
-        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
-        return Err("Failed to compile launcher".into());
-    }
-
-    // 创建资源包
-    println!("Creating resource package...");
-    let resource_file = format!("{}/resources.tar.gz", temp_dir);
-    create_resource_package(main_exe, resource_dirs, &resource_file)?;
-
-    // 读取启动器和资源
-    let launcher_binary = fs::read(&format!("{}/launcher", temp_dir))?;
-    let resource_data = fs::read(&resource_file)?;
-
-    // 创建最终的可执行文件
-    println!("Creating final executable...");
-    {
-        use std::io::Write;
-        let mut final_exe = fs::File::create(output_file)?;
-
-        // 写入启动器
-        final_exe.write_all(&launcher_binary)?;
-
-        // 记录资源偏移
-        let resource_offset = launcher_binary.len();
-
-        // 写入资源数据
-        final_exe.write_all(&resource_data)?;
-
-        // 写入偏移信息（8字节）
-        final_exe.write_all(&(resource_offset as u64).to_le_bytes())?;
-    }
-
-    // 设置执行权限
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(output_file)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(output_file, perms)?;
-    }
-
-    // 清理临时文件
-    fs::remove_dir_all(temp_dir)?;
-
-    Ok(())
-}
-
-fn create_resource_package(
-    main_exe: &str,
-    resource_dirs: &[&String],
-    output_file: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // use std::process::Stdio;
-
-    // 创建临时目录结构
-    let temp_structure = "temp_structure";
-    fs::create_dir_all(temp_structure)?;
-
-    // 复制主程序
-    let _main_path = Path::new(main_exe);
-    fs::copy(main_exe, format!("{}/sekai.x86_64", temp_structure))?;
-
-    // 复制资源目录
-    for dir in resource_dirs {
-        let dir_path = Path::new(dir);
-        if dir_path.exists() && dir_path.is_dir() {
-            let output = Command::new("cp")
-                .args(&["-r", dir, &format!("{}/", temp_structure)])
-                .output()?;
-            if !output.status.success() {
-                return Err(format!("Failed to copy directory: {}", dir).into());
+        match zip_resource_files(&resource_dirs, &zip_output_path) {
+            Ok(_) => {
+                println!(
+                    "Successfully created temporary resource archive: {:?}",
+                    zip_output_path
+                );
+                // Copy the zip file to test_env for debugging
+                // let debug_path = Path::new("d:/Godot/sekai-pack/test_env/debug_resource.zip");
+                // match fs::copy(&zip_output_path, &debug_path) {
+                //     Ok(_) => println!("Debug zip copied to: {:?}", debug_path),
+                //     Err(e) => eprintln!("Warning: Failed to copy debug zip: {}", e),
+                // }
+            }
+            Err(e) => {
+                eprintln!("Error creating resource archive: {}", e);
+                std::process::exit(1);
             }
         }
-    }
 
-    // 创建tar.gz包
-    let output = Command::new("tar")
-        .args(&["-czf", output_file, "-C", temp_structure, "."])
-        .output()?;
+        let output_path = if i < args.len() && args[i] == "-o" && i + 1 < args.len() {
+            Path::new(&args[i + 1]).to_path_buf()
+        } else {
+            eprintln!("No output path specified");
+            std::process::exit(1);
+        };
 
-    if !output.status.success() {
-        eprintln!("Tar creation failed:");
-        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
-        return Err("Failed to create resource package".into());
+        match write_into_main_exe(
+            &args[1],
+            &zip_output_path.to_str().unwrap().to_string(),
+            &output_path.to_str().unwrap().to_string(),
+        ) {
+            Ok(_) => println!("Successfully wrote resource archive into main executable"),
+            Err(e) => {
+                eprintln!("Error writing resource archive into main executable: {}", e);
+                std::process::exit(1);
+            }
+        };
     }
-
-    // 清理临时目录
-    fs::remove_dir_all(temp_structure)?;
-
-    Ok(())
-}
-
-fn generate_launcher_c() -> String {
-    r#"#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <libgen.h>
-#include <stdint.h>
-
-int main(int argc, char *argv[]) {
-    if (argc > 1 && strcmp(argv[1], "--version") == 0) {
-        printf("bundled app v1.0\n");
-        return 0;
-    }
-    
-    // 获取自身路径
-    char exe_path[4096];
-    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
-    if (len == -1) {
-        perror("Failed to get executable path");
-        return 1;
-    }
-    exe_path[len] = '\0';
-    
-    // 创建临时目录
-    char temp_template[] = "/tmp/bundled_app_XXXXXX";
-    char *temp_dir = mkdtemp(temp_template);
-    if (!temp_dir) {
-        perror("Failed to create temp directory");
-        return 1;
-    }
-    
-    // 打开自身文件
-    int exe_fd = open(exe_path, O_RDONLY);
-    if (exe_fd == -1) {
-        perror("Failed to open executable");
-        return 1;
-    }
-    
-    // 获取文件大小
-    struct stat st;
-    if (fstat(exe_fd, &st) == -1) {
-        perror("Failed to get file size");
-        close(exe_fd);
-        return 1;
-    }
-    off_t file_size = st.st_size;
-    
-    // 读取资源偏移（最后8字节）
-    uint64_t offset;
-    if (lseek(exe_fd, file_size - 8, SEEK_SET) == -1) {
-        perror("Failed to seek to offset");
-        close(exe_fd);
-        return 1;
-    }
-    if (read(exe_fd, &offset, 8) != 8) {
-        perror("Failed to read offset");
-        close(exe_fd);
-        return 1;
-    }
-    
-    // 提取资源数据
-    if (lseek(exe_fd, offset, SEEK_SET) == -1) {
-        perror("Failed to seek to resources");
-        close(exe_fd);
-        return 1;
-    }
-    
-    char resources_path[512];
-    snprintf(resources_path, sizeof(resources_path), "%s/resources.tar.gz", temp_dir);
-    
-    int resources_fd = open(resources_path, O_CREAT | O_WRONLY, 0644);
-    if (resources_fd == -1) {
-        perror("Failed to create resources file");
-        close(exe_fd);
-        return 1;
-    }
-    
-    char buffer[4096];
-    ssize_t bytes_read;
-    off_t remaining = file_size - 8 - offset;
-    while (remaining > 0 && (bytes_read = read(exe_fd, buffer, sizeof(buffer))) > 0) {
-        if (bytes_read > remaining) bytes_read = remaining;
-        write(resources_fd, buffer, bytes_read);
-        remaining -= bytes_read;
-    }
-    
-    close(exe_fd);
-    close(resources_fd);
-    
-    // 解压资源
-    char extract_cmd[1024];
-    snprintf(extract_cmd, sizeof(extract_cmd), "cd '%s' && tar -xzf resources.tar.gz", temp_dir);
-    int result = system(extract_cmd);
-    if (result != 0) {
-        fprintf(stderr, "Failed to extract resources\n");
-        return 1;
-    }
-    unlink(resources_path);
-    
-    // 构建主程序路径
-    char sekai_path[512];
-    snprintf(sekai_path, sizeof(sekai_path), "%s/sekai.x86_64", temp_dir);
-    
-    // 设置执行权限
-    chmod(sekai_path, 0755);
-    
-    // 准备参数
-    char path_arg[512];
-    snprintf(path_arg, sizeof(path_arg), "--path=%s", temp_dir);
-    
-    // 执行主程序
-    char *exec_args[argc + 3];
-    exec_args[0] = sekai_path;
-    exec_args[1] = path_arg;
-    
-    int j = 2;
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--version") != 0) {
-            exec_args[j++] = argv[i];
-        }
-    }
-    exec_args[j] = NULL;
-    
-    execv(sekai_path, exec_args);
-    
-    // 如果execv返回，说明出错了
-    perror("Failed to execute main program");
-    
-    // 清理临时目录
-    char cleanup_cmd[512];
-    snprintf(cleanup_cmd, sizeof(cleanup_cmd), "rm -rf '%s'", temp_dir);
-    system(cleanup_cmd);
-    
-    return 1;
-}"#
-    .to_string()
 }

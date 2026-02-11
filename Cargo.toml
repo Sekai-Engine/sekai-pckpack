@@ -4,3 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+tempfile = "3.25.0"
+walkdir = "2.5.0"
+zip = "7.4.0"
