@@ -64,16 +64,22 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        let tool_path = exe_dir.join("tool").join("godotpcktool.exe");
+        let tool_name = if cfg!(target_os = "windows") {
+            "godotpcktool.exe"
+        } else {
+            "godotpcktool"
+        };
+        let tool_path = exe_dir.join("tool").join(tool_name);
         if !tool_path.exists() {
             eprintln!(
-                "Error: godotpcktool.exe not found at {}",
+                "Error: {} not found at {}",
+                tool_name,
                 tool_path.display()
             );
             std::process::exit(1);
         }
 
-        println!("Using godotpcktool.exe at {}", tool_path.display());
+        println!("Using {} at {}", tool_name, tool_path.display());
 
         // 将资源文件复制到temp文件夹
         let resources_dir = temp_dir.path().join("sekai-resources");
@@ -108,7 +114,12 @@ fn main() {
         }
 
         let pck_path = temp_dir.path().join("sekai.pck");
-        let exe_copy = temp_dir.path().join("sekai.exe");
+        let exe_name = if cfg!(target_os = "windows") {
+            "sekai.exe"
+        } else {
+            "sekai"
+        };
+        let exe_copy = temp_dir.path().join(exe_name);
 
         extract_launcher(Path::new(&args[1]), &exe_copy, Some(&pck_path));
 
