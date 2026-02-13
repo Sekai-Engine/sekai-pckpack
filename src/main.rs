@@ -112,9 +112,6 @@ fn main() {
 
         extract_launcher(Path::new(&args[1]), &exe_copy, Some(&pck_path));
 
-        fs::copy(&pck_path, "D:\\Godot\\sekai-template\\bin\\embed\\sekai.pck").unwrap();
-        fs::copy(&exe_copy, "D:\\Godot\\sekai-template\\bin\\embed\\sekai-test.exe").unwrap();
-
         let temp_resources_dir = resources_dir.to_str().unwrap();
         let mut command = Command::new(tool_path);
         command.arg(&pck_path.to_str().unwrap());
