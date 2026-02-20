@@ -210,10 +210,11 @@ fn extract_launcher(input_path: &Path, output_path: &Path, pck_output_path: Opti
     if let Some(pck_out) = pck_output_path {
         if split_index < buffer.len() {
             let mut pck_file = File::create(pck_out).expect("Failed to create output PCK");
-            // If we found via footer, the PCK data is between split_index and (len - 12)
-            // But we might want to keep it simple and write everything, OR strip the footer?
-            // Usually tools expect clean PCK. Let's strip the footer if we found it via footer logic.
-            
+            /*
+             * If we found via footer, the PCK data is between split_index and (len - 12)
+             * But we might want to keep it simple and write everything, OR strip the footer?
+             * Usually tools expect clean PCK. Let's strip the footer if we found it via footer logic.
+             */
             let end_index = if len >= 12 && &buffer[len - 4..] == magic && split_index == len - 12 - (u64::from_le_bytes(buffer[len - 12..len - 4].try_into().unwrap()) as usize) {
                 len - 12
             } else {
