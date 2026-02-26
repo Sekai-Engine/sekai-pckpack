@@ -7,7 +7,6 @@ use std::{
 };
 use tempfile::tempdir;
 use walkdir::WalkDir;
-use zip::unstable::LittleEndianWriteExt;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -71,11 +70,7 @@ fn main() {
         };
         let tool_path = exe_dir.join("tool").join(tool_name);
         if !tool_path.exists() {
-            eprintln!(
-                "Error: {} not found at {}",
-                tool_name,
-                tool_path.display()
-            );
+            eprintln!("Error: {} not found at {}", tool_name, tool_path.display());
             std::process::exit(1);
         }
 
@@ -161,11 +156,22 @@ fn write_pck_to_exe(exe_path: &Path, pck_path: &Path, output_path: &Path) {
     let pck_size = std::io::copy(&mut pck_file, &mut output_file).expect("Failed to copy PCK");
 
     // Write PCK size (u64) and magic (u32)
-    output_file.write_u64_le(pck_size).expect("Failed to write PCK size");
-    output_file.write_all(b"GDPC").expect("Failed to write magic");
+    output_file
+        .write_all(&pck_size.to_le_bytes())
+        .expect("Failed to write PCK size");
+    output_file
+        .write_all(b"GDPC")
+        .expect("Failed to write magic");
 }
 
 fn extract_launcher(input_path: &Path, output_path: &Path, pck_output_path: Option<&Path>) {
+    if input_path.is_dir() {
+        eprintln!(
+            "Error: Input path '{}' is a directory. Expected an executable file as the first argument.",
+            input_path.display()
+        );
+        std::process::exit(1);
+    }
     let mut file = File::open(input_path).expect("Failed to open input executable");
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer)
@@ -181,7 +187,7 @@ fn extract_launcher(input_path: &Path, output_path: &Path, pck_output_path: Opti
         if footer_magic == magic {
             let size_bytes = &buffer[len - 12..len - 4];
             let pck_size = u64::from_le_bytes(size_bytes.try_into().unwrap()) as usize;
-            
+
             // Check if size is reasonable and matches header
             let start_pos = len - 12 - pck_size;
             if start_pos < len && &buffer[start_pos..start_pos + 4] == magic {
@@ -215,7 +221,14 @@ fn extract_launcher(input_path: &Path, output_path: &Path, pck_output_path: Opti
              * But we might want to keep it simple and write everything, OR strip the footer?
              * Usually tools expect clean PCK. Let's strip the footer if we found it via footer logic.
              */
-            let end_index = if len >= 12 && &buffer[len - 4..] == magic && split_index == len - 12 - (u64::from_le_bytes(buffer[len - 12..len - 4].try_into().unwrap()) as usize) {
+            let end_index = if len >= 12
+                && &buffer[len - 4..] == magic
+                && split_index
+                    == len
+                        - 12
+                        - (u64::from_le_bytes(buffer[len - 12..len - 4].try_into().unwrap())
+                            as usize)
+            {
                 len - 12
             } else {
                 len
